@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { LessonDifficulty } from '@prisma/client';
+import { ProgrammingLanguage } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 
 function startOfDayUTC(date: Date): Date {
@@ -8,83 +8,144 @@ function startOfDayUTC(date: Date): Date {
   return d;
 }
 
+// Lesson row joined with its course's language — Lesson no longer holds language directly.
+interface LessonWithLanguage {
+  id: string;
+  title: string;
+  description: string;
+  estimatedMinutes: number;
+  xpReward: number;
+  difficulty: import('@prisma/client').LessonDifficulty;
+  order: number;
+  sectionId: string;
+  language: ProgrammingLanguage;
+  sectionOrder: number;
+}
+
 @Injectable()
 export class ForYouService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getForYou(userId: string) {
-    // Single round-trip for user + onboarding
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
       include: { onboarding: true },
     });
 
-    // All published lessons ordered by progression
-    const lessons = await this.prisma.lesson.findMany({
-      where: { isPublished: true },
-      orderBy: { order: 'asc' },
+    // Pull every published lesson with its course language attached.
+    // Sequence = section.order ASC, then lesson.order ASC.
+    const lessonRows = await this.prisma.lesson.findMany({
+      where: { isPublished: true, section: { course: { isPublished: true } } },
+      include: { section: { include: { course: { select: { language: true } } } } },
+      orderBy: [{ section: { order: 'asc' } }, { order: 'asc' }],
     });
 
-    // All user progress — one query, no N+1
+    const allLessons: LessonWithLanguage[] = lessonRows.map((l) => ({
+      id: l.id,
+      title: l.title,
+      description: l.description,
+      estimatedMinutes: l.estimatedMinutes,
+      xpReward: l.xpReward,
+      difficulty: l.difficulty,
+      order: l.order,
+      sectionId: l.sectionId,
+      language: l.section.course.language,
+      sectionOrder: l.section.order,
+    }));
+
     const progressRecords = await this.prisma.userLessonProgress.findMany({
       where: { userId },
     });
-    const progressMap = new Map(progressRecords.map((p) => [p.lessonId, p]));
+    const completedIds = new Set(
+      progressRecords.filter((p) => p.isCompleted).map((p) => p.lessonId),
+    );
 
-    // Today's activity
     const todayUTC = startOfDayUTC(new Date());
     const todayActivity = await this.prisma.dailyActivity.findUnique({
       where: { userId_date: { userId, date: todayUTC } },
     });
 
-    // ── Completed lesson stats ───────────────────────────────────────────────
-    const completedIds = new Set(
-      progressRecords.filter((p) => p.isCompleted).map((p) => p.lessonId),
-    );
-    const completedLessons = lessons.filter((l) => completedIds.has(l.id));
-    const totalMinutesLearned = completedLessons.reduce(
-      (acc, l) => acc + l.estimatedMinutes,
-      0,
-    );
+    // ── Language scope ───────────────────────────────────────────────────────
+    const selectedLanguage = user.onboarding?.selectedLanguage ?? null;
+    const langLessons = selectedLanguage
+      ? allLessons.filter((l) => l.language === selectedLanguage)
+      : allLessons;
 
-    // ── Recommendation logic ─────────────────────────────────────────────────
-    const unfinished = lessons.filter((l) => !completedIds.has(l.id));
+    const totalLessons = langLessons.length;
+    const completedInLang = langLessons.filter((l) => completedIds.has(l.id)).length;
+    const progressPercent =
+      totalLessons > 0 ? Math.floor((completedInLang / totalLessons) * 100) : 0;
 
-    let recommendedLesson = unfinished[0] ?? null; // default: first unfinished by order
+    // ── Recommendation ───────────────────────────────────────────────────────
+    const unfinished = langLessons.filter((l) => !completedIds.has(l.id));
 
-    if (completedIds.size === 0 && user.onboarding) {
-      // New user: prefer a BEGINNER lesson in their chosen language
-      const match = unfinished.find(
-        (l) =>
-          l.language === user.onboarding!.selectedLanguage &&
-          l.difficulty === LessonDifficulty.BEGINNER,
-      );
-      if (match) recommendedLesson = match;
+    let recommendedLesson: LessonWithLanguage | null = null;
+
+    if (completedInLang === 0) {
+      recommendedLesson = langLessons[0] ?? null;
+    } else if (unfinished.length > 0) {
+      recommendedLesson = unfinished[0];
+    } else {
+      const completedInLangLessons = langLessons.filter((l) => completedIds.has(l.id));
+      recommendedLesson =
+        completedInLangLessons[completedInLangLessons.length - 1] ?? langLessons[0] ?? null;
     }
 
-    // ── Next lessons queue (5 lessons from current position) ─────────────────
+    // ── Next lessons queue (5 from recommended) ──────────────────────────────
     const startIndex = recommendedLesson
-      ? lessons.findIndex((l) => l.id === recommendedLesson!.id)
+      ? langLessons.findIndex((l) => l.id === recommendedLesson!.id)
       : 0;
 
-    const nextLessons = lessons.slice(startIndex, startIndex + 5).map((lesson) => {
+    const nextLessons = langLessons.slice(startIndex, startIndex + 5).map((lesson) => {
       const isCompleted = completedIds.has(lesson.id);
-      // Completed lessons are always visible; recommended (next) lesson is unlocked;
-      // everything further in the queue is locked until the user progresses.
-      const isLocked = !isCompleted && lesson.id !== recommendedLesson?.id;
       return {
         id: lesson.id,
         title: lesson.title,
         isCompleted,
-        isLocked,
+        isLocked: !isCompleted && lesson.id !== recommendedLesson?.id,
+        language: lesson.language,
+        difficulty: lesson.difficulty,
       };
     });
+
+    // ── Tracks per language ──────────────────────────────────────────────────
+    const languageMap = new Map<ProgrammingLanguage, LessonWithLanguage[]>();
+    for (const lesson of allLessons) {
+      if (!languageMap.has(lesson.language)) languageMap.set(lesson.language, []);
+      languageMap.get(lesson.language)!.push(lesson);
+    }
+
+    const tracks = Array.from(languageMap.entries()).map(([language, lessons]) => {
+      const completedCount = lessons.filter((l) => completedIds.has(l.id)).length;
+      const total = lessons.length;
+      return {
+        language,
+        progressPercent: total > 0 ? Math.round((completedCount / total) * 100) : 0,
+        completedLessons: completedCount,
+        totalLessons: total,
+      };
+    });
+
+    if (selectedLanguage) {
+      tracks.sort((a, b) => {
+        if (a.language === selectedLanguage) return -1;
+        if (b.language === selectedLanguage) return 1;
+        return 0;
+      });
+    }
+
+    // ── Stats ─────────────────────────────────────────────────────────────────
+    const totalMinutesLearned = allLessons
+      .filter((l) => completedIds.has(l.id))
+      .reduce((acc, l) => acc + l.estimatedMinutes, 0);
 
     return {
       user: {
         xp: user.xp,
         streak: user.streak,
         level: user.level,
+        username: user.username,
+        displayName: user.displayName,
       },
       onboarding: user.onboarding
         ? {
@@ -94,7 +155,7 @@ export class ForYouService {
         : null,
       dailyProgress: {
         completedLessons: todayActivity?.lessonsCompleted ?? 0,
-        totalLessons: lessons.length,
+        totalLessons: langLessons.length,
       },
       recommendedLesson: recommendedLesson
         ? {
@@ -104,9 +165,14 @@ export class ForYouService {
             estimatedMinutes: recommendedLesson.estimatedMinutes,
             xpReward: recommendedLesson.xpReward,
             difficulty: recommendedLesson.difficulty,
+            language: recommendedLesson.language,
+            progressPercent,
+            completedLessons: completedInLang,
+            totalLessons,
           }
         : null,
       nextLessons,
+      tracks,
       stats: {
         completedLessons: completedIds.size,
         totalMinutesLearned,

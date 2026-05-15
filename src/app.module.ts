@@ -5,7 +5,9 @@ import { AuthModule } from './modules/auth/auth.module';
 import { ForYouModule } from './modules/for-you/for-you.module';
 import { LessonsModule } from './modules/lessons/lessons.module';
 import { OnboardingModule } from './modules/onboarding/onboarding.module';
+import { ProfileModule } from './modules/profile/profile.module';
 import { ProgressModule } from './modules/progress/progress.module';
+import { TracksModule } from './modules/tracks/tracks.module';
 import { UsersModule } from './modules/users/users.module';
 
 @Module({
@@ -16,8 +18,10 @@ import { UsersModule } from './modules/users/users.module';
     AuthModule,
     OnboardingModule,
     LessonsModule,
+    TracksModule,
     ForYouModule,
     ProgressModule,
+    ProfileModule,
   ],
 })
 export class AppModule {}

@@ -47,16 +47,22 @@ enum LessonDifficulty {
   BEGINNER
   BASIC
   INTERMEDIATE
+  ADVANCED
 }
 
-enum LessonContentType {
-  TEXT
+enum LessonBlockType {
+  THEORY
+  ANALOGY
+  CODE
+  EXPLANATION
+  MISTAKE
+  QUIZ
 }
 
-enum QuizQuestionType {
-  SINGLE_CHOICE
-  MULTIPLE_CHOICE
-  FILL_CODE
+enum LessonProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
 }
 
 // ─── Models ───────────────────────────────────────────────────────────────────
@@ -76,9 +82,12 @@ model User {
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
-  onboarding           Onboarding?
-  progress             UserLessonProgress[]
-  dailyActivities      DailyActivity[]
+  onboarding         Onboarding?
+  progress           UserLessonProgress[]
+  blockProgress      UserLessonBlockProgress[]
+  dailyActivities    DailyActivity[]
+  xpTransactions     XPTransaction[]
+  dailyChallenges    UserDailyChallenge[]
 
   @@map("users")
 }
@@ -100,92 +109,113 @@ model Onboarding {
   @@map("onboardings")
 }
 
-model Lesson {
+// ─── Course → Section → Lesson → Block hierarchy ─────────────────────────────
+
+model Course {
   id               String              @id @default(uuid())
+  slug             String              @unique
   title            String
   description      String
   language         ProgrammingLanguage
   difficulty       LessonDifficulty
   estimatedMinutes Int
-  xpReward         Int                 @default(10)
-  order            Int
+  totalXp          Int
   isPublished      Boolean             @default(false)
   createdAt        DateTime            @default(now())
   updatedAt        DateTime            @updatedAt
 
-  theoryBlocks     TheoryBlock[]
-  quizQuestions    QuizQuestion[]
-  codeTasks        CodeTask[]
-  userProgress     UserLessonProgress[]
+  sections         CourseSection[]
+
+  @@map("courses")
+}
+
+model CourseSection {
+  id               String   @id @default(uuid())
+  courseId         String
+  course           Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title            String
+  description      String?
+  order            Int
+  estimatedMinutes Int
+  totalXp          Int
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  lessons          Lesson[]
+
+  @@map("course_sections")
+}
+
+model Lesson {
+  id               String           @id @default(uuid())
+  slug             String           @unique
+  sectionId        String
+  section          CourseSection    @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  title            String
+  description      String
+  order            Int
+  estimatedMinutes Int
+  xpReward         Int              @default(10)
+  difficulty       LessonDifficulty
+  isPublished      Boolean          @default(false)
+  isFree           Boolean          @default(false)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  blocks         LessonBlock[]
+  progress       UserLessonProgress[]
+  xpTransactions XPTransaction[]
 
   @@map("lessons")
 }
 
-model TheoryBlock {
-  id        String            @id @default(uuid())
+model LessonBlock {
+  id        String          @id @default(uuid())
   lessonId  String
-  lesson    Lesson            @relation(fields: [lessonId], references: [id], onDelete: Cascade)
-  type      LessonContentType
-  content   String
+  lesson    Lesson          @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  type      LessonBlockType
   order     Int
-  createdAt DateTime          @default(now())
+  payload   Json
+  createdAt DateTime        @default(now())
 
-  @@map("theory_blocks")
+  userProgress UserLessonBlockProgress[]
+
+  @@map("lesson_blocks")
 }
 
-model QuizQuestion {
-  id        String           @id @default(uuid())
-  lessonId  String
-  lesson    Lesson           @relation(fields: [lessonId], references: [id], onDelete: Cascade)
-  question  String
-  type      QuizQuestionType
-  order     Int
-  createdAt DateTime         @default(now())
-
-  answers   QuizAnswer[]
-
-  @@map("quiz_questions")
-}
-
-model QuizAnswer {
-  id         String       @id @default(uuid())
-  questionId String
-  question   QuizQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  text       String
-  isCorrect  Boolean
-  createdAt  DateTime     @default(now())
-
-  @@map("quiz_answers")
-}
-
-model CodeTask {
-  id             String   @id @default(uuid())
-  lessonId       String
-  lesson         Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
-  starterCode    String
-  expectedAnswer String
-  order          Int
-  createdAt      DateTime @default(now())
-
-  @@map("code_tasks")
-}
+// ─── User progress ───────────────────────────────────────────────────────────
 
 model UserLessonProgress {
-  id              String    @id @default(uuid())
+  id              String               @id @default(uuid())
   userId          String
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   lessonId        String
-  lesson          Lesson    @relation(fields: [lessonId], references: [id], onDelete: Cascade)
-  progressPercent Int       @default(0)
-  isCompleted     Boolean   @default(false)
-  xpEarned        Int       @default(0)
+  lesson          Lesson               @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  status          LessonProgressStatus @default(NOT_STARTED)
+  progressPercent Int                  @default(0)
+  isCompleted     Boolean              @default(false)
+  xpEarned        Int                  @default(0)
   completedAt     DateTime?
   lastOpenedAt    DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
 
   @@unique([userId, lessonId])
   @@map("user_lesson_progress")
+}
+
+model UserLessonBlockProgress {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  blockId     String
+  block       LessonBlock @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  isCompleted Boolean     @default(false)
+  completedAt DateTime?
+  createdAt   DateTime    @default(now())
+
+  @@unique([userId, blockId])
+  @@map("user_lesson_block_progress")
 }
 
 model DailyActivity {
@@ -198,4 +228,48 @@ model DailyActivity {
 
   @@unique([userId, date])
   @@map("daily_activities")
+}
+
+// ─── XP economy ──────────────────────────────────────────────────────────────
+
+model XPTransaction {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount    Int
+  reason    String
+  lessonId  String?
+  lesson    Lesson?  @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@map("xp_transactions")
+}
+
+// ─── Daily challenges (architecture only, no endpoints yet) ──────────────────
+
+model DailyChallenge {
+  id          String              @id @default(uuid())
+  title       String
+  description String
+  language    ProgrammingLanguage
+  xpReward    Int
+  isPublished Boolean             @default(false)
+  createdAt   DateTime            @default(now())
+
+  userChallenges UserDailyChallenge[]
+
+  @@map("daily_challenges")
+}
+
+model UserDailyChallenge {
+  id          String         @id @default(uuid())
+  userId      String
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  challengeId String
+  challenge   DailyChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  isCompleted Boolean        @default(false)
+  completedAt DateTime?
+
+  @@unique([userId, challengeId])
+  @@map("user_daily_challenges")
 }

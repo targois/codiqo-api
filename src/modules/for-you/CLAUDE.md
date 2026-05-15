@@ -2,8 +2,7 @@
 
 ## Purpose
 
-Single aggregated endpoint that powers the homepage feed.
-Combines user stats, onboarding preferences, daily progress, recommendation, and next lessons queue into one response — avoiding multiple round-trips from the frontend.
+Single aggregated endpoint for the homepage feed. Combines user stats, hero recommendation, next lessons queue, language tracks, and daily progress in one response. Hero is fully API-driven.
 
 ## Endpoint
 
@@ -15,59 +14,84 @@ Combines user stats, onboarding preferences, daily progress, recommendation, and
 
 ```json
 {
-  "user": { "xp": 10, "streak": 1, "level": 1 },
-  "onboarding": { "selectedLanguage": "TYPESCRIPT", "currentLevel": "BEGINNER" },
-  "dailyProgress": { "completedLessons": 1, "totalLessons": 5 },
+  "user": { "xp": 10, "streak": 1, "level": 1, "username": "...", "displayName": "..." },
+  "onboarding": { "selectedLanguage": "PYTHON", "currentLevel": "BEGINNER" },
+  "dailyProgress": { "completedLessons": 1, "totalLessons": 35 },
   "recommendedLesson": {
     "id": "...", "title": "...", "description": "...",
-    "estimatedMinutes": 10, "xpReward": 10, "difficulty": "BEGINNER"
+    "estimatedMinutes": 5, "xpReward": 10,
+    "difficulty": "BEGINNER", "language": "PYTHON",
+    "progressPercent": 33, "completedLessons": 1, "totalLessons": 35
   },
   "nextLessons": [
-    { "id": "...", "title": "...", "isCompleted": false, "isLocked": false },
-    { "id": "...", "title": "...", "isCompleted": false, "isLocked": true }
+    { "id": "...", "title": "...", "isCompleted": true, "isLocked": false, "language": "PYTHON", "difficulty": "BEGINNER" }
   ],
-  "stats": { "completedLessons": 1, "totalMinutesLearned": 10 }
+  "tracks": [
+    { "language": "PYTHON", "progressPercent": 3, "completedLessons": 1, "totalLessons": 35 }
+  ],
+  "stats": { "completedLessons": 1, "totalMinutesLearned": 5 }
 }
 ```
 
-`recommendedLesson` is `null` if all lessons are completed or no lessons exist.
-`onboarding` is `null` if user hasn't completed onboarding yet.
+## Schema impact: language now lives on Course
 
-## Recommendation logic
+Lesson no longer has a `language` column. The for-you query joins through `Lesson → CourseSection → Course → language`:
 
-**New user (0 completed lessons):**
-1. Find first lesson matching `onboarding.selectedLanguage` + `BEGINNER` difficulty
-2. Fallback: first published lesson by `order`
+```ts
+prisma.lesson.findMany({
+  where: { isPublished: true, section: { course: { isPublished: true } } },
+  include: { section: { include: { course: { select: { language: true } } } } },
+  orderBy: [{ section: { order: 'asc' } }, { order: 'asc' }],
+});
+```
 
-**Returning user:**
-- First unfinished lesson by `order` (next after last completed)
+After the query, lessons are flattened to `{ ..., language, sectionOrder }` so downstream filters/grouping look like the old single-table version.
 
-Only `isPublished = true` lessons are considered.
+## Recommendation algorithm — deterministic, never null when lessons exist
 
-## Next lessons queue
+Three cases, evaluated in order:
+1. **New user** (`completedInLang === 0`) → first lesson in `selectedLanguage` by sequence
+2. **Returning user** (has completions, unfinished remain) → first unfinished by sequence
+3. **All complete** → last completed in language; falls back to first lesson
 
-Returns up to 5 lessons starting from the recommended lesson position.
+Sequence = `section.order ASC, lesson.order ASC` (course-wide).
 
-**Locking rules:**
-- `isCompleted = true` → always shown as completed, never locked
-- `lesson.id === recommendedLesson.id` → unlocked (this is the next step)
-- everything else → `isLocked = true`
+## Language consistency — STRICT
+
+`recommendedLesson.language` always equals `onboarding.selectedLanguage`.
+`nextLessons` are always in `selectedLanguage`.
+TypeScript lessons NEVER show for a PYTHON user.
+
+If onboarding is incomplete → fallback to all lessons.
+
+## Progress calc (hero)
+
+```
+progressPercent = floor(completedInLang / totalLessons * 100)
+```
+
+`tracks[]` uses `Math.round` (visual). `recommendedLesson.progressPercent` uses `Math.floor` (truthful).
+
+## Tracks
+
+Built from `Lesson → Course.language` grouping. Onboarding language sorts first. Only languages with at least one published lesson appear.
 
 ## Query strategy (no N+1)
 
-4 queries total per request:
-1. `user` with `onboarding` (join)
-2. All published lessons ordered by `order`
-3. All `UserLessonProgress` for the user
-4. `DailyActivity` for today (UTC midnight)
+4 queries:
+1. user + onboarding
+2. all published lessons + their `section.course.language`
+3. all `UserLessonProgress` for user
+4. today's `DailyActivity`
 
-Lesson-progress join done in-memory using a `Map<lessonId, progress>`.
+Language filtering and grouping happen in-memory after the lesson fetch.
 
 ## File structure
 
 ```
 for-you/
-  for-you.service.ts    — getForYou(userId) — all business logic
+  for-you.service.ts    — getForYou(userId)
   for-you.controller.ts — GET /for-you
   for-you.module.ts
+  CLAUDE.md
 ```

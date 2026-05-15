@@ -3,111 +3,134 @@
 ## Workflow
 
 1. Edit `prisma/schema.prisma`
-2. Run `pnpm prisma:migrate` — creates SQL file in `migrations/` and applies it
-3. Prisma auto-regenerates the TypeScript client after migration
+2. Run `pnpm prisma:migrate` (interactive) — or `pnpm prisma db push --accept-data-loss` (dev shortcut, no migration history)
+3. Prisma auto-regenerates the TypeScript client
+4. Run `pnpm prisma:seed` to refresh course content
 
 Never edit migration SQL files by hand.
 
 ## Naming conventions
 
-- Model names: PascalCase singular (`User`, `Course`, `Lesson`)
+- Model names: PascalCase singular (`Course`, `Lesson`, `LessonBlock`)
 - Table names: snake_case plural via `@@map("table_name")`
 - Column names: camelCase in schema → Prisma auto-maps to the same in TS client
-- IDs: `String @id @default(uuid())` — UUIDs for all primary keys
-- Timestamps: every model has `createdAt DateTime @default(now())` and `updatedAt DateTime @updatedAt`
+- IDs: `String @id @default(uuid())` for all PKs
+- Slugs: `String @unique` on Course and Lesson — stable URLs, idempotent re-seed
+- Timestamps: `createdAt DateTime @default(now())` and `updatedAt DateTime @updatedAt`
 
-## Current schema
+## Domain hierarchy
 
-### User
-Core user record. Holds auth, profile, gamification state.
+```
+Course (per language, per difficulty)
+└── CourseSection (ordered)
+    └── Lesson (ordered, slug, isFree?)
+        └── LessonBlock (ordered, type, payload Json)
+```
 
-| Field | Type | Notes |
-|---|---|---|
-| id | String (uuid) | PK |
-| email | String | unique |
-| username | String | unique |
-| passwordHash | String | bcrypt hash, never returned in API responses |
-| displayName | String? | optional display name |
-| avatarUrl | String? | URL to profile picture |
-| xp | Int | total XP earned, default 0 |
-| level | Int | computed from XP, default 1 |
-| streak | Int | current day streak, default 0 |
-| streakLastDate | DateTime? | last day user completed a lesson |
-| isOnboardingComplete | Boolean | false until onboarding quiz done |
-| createdAt | DateTime | auto |
-| updatedAt | DateTime | auto |
+Per user:
+```
+UserLessonProgress (per lesson — status, percent, completedAt)
+└── UserLessonBlockProgress (per block — isCompleted)
+XPTransaction (append-only audit log of every XP award)
+DailyActivity (per UTC day — for streak)
+```
 
-### Onboarding (migration: 20260512175805_add_onboarding)
+## Course
 
-1-to-1 with User. `userId` is unique at DB level. Cascade deletes with User.
-Creation uses `$transaction` to atomically set `User.isOnboardingComplete = true`.
+| Field | Notes |
+|---|---|
+| slug | unique, used in URLs and idempotent seed (`python-programming`) |
+| language | `ProgrammingLanguage` enum — drives /api/tracks/:language and for-you |
+| difficulty | overall course tier; individual lessons have their own difficulty |
+| totalXp / estimatedMinutes | computed from sections at seed time |
+| isPublished | gate visibility |
 
-**Enums:** `ProgrammingLanguage` · `UserLearningLevel` · `LearningGoal` · `DailyLearningTime` · `PreferredLearningFormat`
+## CourseSection
 
-| Field | Type | Notes |
-|---|---|---|
-| id | String (uuid) | PK |
-| userId | String | unique FK → users, CASCADE |
-| selectedLanguage | ProgrammingLanguage | |
-| currentLevel | UserLearningLevel | |
-| learningGoal | LearningGoal | |
-| dailyTime | DailyLearningTime | |
-| preferredFormat | PreferredLearningFormat | |
-| isCompleted | Boolean | default false, set true on create |
-| createdAt | DateTime | auto |
-| updatedAt | DateTime | auto |
+| Field | Notes |
+|---|---|
+| courseId | FK → Course CASCADE |
+| order | section order within the course (1-based) |
+| totalXp / estimatedMinutes | computed from lessons at seed time |
 
-### Lesson (migration: 20260513193042_add_lessons_progress_streak)
+## Lesson
 
-Content unit. `isPublished` controls visibility. `order` determines sequence.
+Lesson no longer holds `language` directly — language lives on its `section.course`.
+Queries that need language filter through `section.course.language`.
 
-| Field | Type | Notes |
-|---|---|---|
-| id | String (uuid) | PK |
-| title, description | String | |
-| language | ProgrammingLanguage | |
-| difficulty | LessonDifficulty | BEGINNER / BASIC / INTERMEDIATE |
-| estimatedMinutes | Int | |
-| xpReward | Int | default 10 |
-| order | Int | sort order for feed |
-| isPublished | Boolean | false = hidden from API |
+| Field | Notes |
+|---|---|
+| sectionId | FK → CourseSection CASCADE |
+| slug | unique (`python-print-and-first-output`) |
+| order | lesson order within the section (1-based) |
+| difficulty | `LessonDifficulty` (BEGINNER/BASIC/INTERMEDIATE/ADVANCED) |
+| xpReward | XP awarded on first completion |
+| isFree | preview-without-account flag (not enforced in MVP) |
 
-Related models (all cascade-delete with Lesson):
-- `TheoryBlock` — `type: LessonContentType`, `content`, `order`
-- `QuizQuestion` — `type: QuizQuestionType`, `order` → has `QuizAnswer[]`
-- `CodeTask` — `starterCode`, `expectedAnswer`, `order`
+## LessonBlock
 
-### UserLessonProgress
+The single content unit. **`payload` is `Json` — never markdown, never HTML.**
+Frontend renders by `type`; backend validates by `type` (e.g. quiz answer index).
 
-One record per (user, lesson) pair. `@@unique([userId, lessonId])`.
+| `type` | Payload shape |
+|---|---|
+| `THEORY` | `{ title, content }` |
+| `ANALOGY` | `{ title, content }` |
+| `CODE` | `{ language, filename, code }` |
+| `EXPLANATION` | `{ items: [{ line, explanation }] }` |
+| `MISTAKE` | `{ title, content }` |
+| `QUIZ` | `{ question, answers: string[], correctAnswer: number, explanation }` |
 
-| Field | Type | Notes |
-|---|---|---|
-| progressPercent | Int | 0–100 |
-| isCompleted | Boolean | |
-| xpEarned | Int | 0 on re-completion |
-| completedAt | DateTime? | first completion timestamp |
-| lastOpenedAt | DateTime? | updated on every complete call |
+`Json` (not `String`) keeps the contract structured and type-safe at the seed layer; the frontend never has to parse markdown.
 
-### DailyActivity
+## UserLessonProgress
 
-One record per (user, UTC-midnight-date). `@@unique([userId, date])`.
-`lessonsCompleted` increments on each new (non-duplicate) lesson completion.
-Used for: streak calculation + `dailyProgress` in `/api/for-you`.
+Per `(userId, lessonId)`. `@@unique([userId, lessonId])`.
 
-### User — updated fields (same migration)
+| Field | Notes |
+|---|---|
+| status | `LessonProgressStatus` — NOT_STARTED → IN_PROGRESS → COMPLETED |
+| progressPercent | 0–100, recomputed on every block completion |
+| isCompleted | mirror of `status = COMPLETED` for fast filtering |
+| xpEarned | lesson.xpReward on first completion, 0 thereafter |
+| completedAt / lastOpenedAt | first completion timestamp; bumped on every `start` |
 
-- `streakLastDate` renamed to `lastActivityDate`
-- Added relations: `progress UserLessonProgress[]`, `dailyActivities DailyActivity[]`
+## UserLessonBlockProgress
 
-### New enums (same migration)
+Per `(userId, blockId)`. `@@unique([userId, blockId])`.
+For QUIZ blocks: only created when answer is correct.
+For other blocks: created when frontend posts /complete.
 
-- `LessonDifficulty`: BEGINNER / BASIC / INTERMEDIATE
-- `LessonContentType`: TEXT
-- `QuizQuestionType`: SINGLE_CHOICE / MULTIPLE_CHOICE / FILL_CODE
-- `ProgrammingLanguage`: added REACT
+`Lesson.progressPercent = round(completed blocks / total blocks * 100)` — recomputed automatically inside `LessonRuntimeService.completeBlock`.
 
-## Planned models (future migrations)
+## DailyActivity
 
-- `Course` — group lessons into named courses
-- `XpEvent` — immutable log of every XP grant (userId, amount, reason, createdAt)
+Per `(userId, UTC-midnight-date)`. Increments on each new lesson completion. Source for streak + `dailyProgress` in /api/for-you.
+
+## XPTransaction
+
+Append-only audit log. Created by `XpService.awardInTx()`. Never updated/deleted.
+Currently the only `reason` value is `lesson_complete`. Quiz/code-task XP from the previous architecture has been removed in favor of a single award on lesson completion.
+
+## DailyChallenge / UserDailyChallenge
+
+Architecture-only — no endpoints yet. Reserved for future feature.
+
+## Migrations
+
+| Migration | Notes |
+|---|---|
+| `20260509163635_init_users` | initial users |
+| `20260512175805_add_onboarding` | onboarding |
+| `20260513193042_add_lessons_progress_streak` | original lesson tables (dropped) |
+| `20260514212246_add_runtime_tables` | XPTransaction etc. (UserQuizAnswer/UserCodeTaskSubmission later dropped) |
+| (course_engine) | applied via `prisma db push` — Course/CourseSection/LessonBlock/UserLessonBlockProgress; dropped TheoryBlock/QuizQuestion/QuizAnswer/CodeTask/UserQuizAnswer/UserCodeTaskSubmission; added LessonProgressStatus + ADVANCED difficulty |
+
+## Seed
+
+`pnpm prisma:seed` runs `prisma/seed.ts`:
+- wipes existing courses (cascades clean up sections/lessons/blocks/progress)
+- recreates one course: "Python Programming" with 5 sections, 35 lessons, ~600 XP
+- every lesson has 6 blocks: theory + analogy + code + explanation + mistake + quiz
+
+The seed is idempotent (deletes & rebuilds) — safe to re-run.

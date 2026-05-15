@@ -1,142 +1,70 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { LessonProgressStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
-
-function startOfDayUTC(date: Date): Date {
-  const d = new Date(date);
-  d.setUTCHours(0, 0, 0, 0);
-  return d;
-}
+import { TracksService } from '../tracks/tracks.service';
 
 @Injectable()
 export class LessonsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tracksService: TracksService,
+  ) {}
 
   async findById(lessonId: string, userId: string) {
     const lesson = await this.prisma.lesson.findUnique({
       where: { id: lessonId },
       include: {
-        theoryBlocks: { orderBy: { order: 'asc' } },
-        quizQuestions: {
-          orderBy: { order: 'asc' },
-          include: { answers: true },
-        },
-        codeTasks: { orderBy: { order: 'asc' } },
+        blocks: { orderBy: { order: 'asc' } },
+        section: { include: { course: { select: { language: true } } } },
       },
     });
 
     if (!lesson || !lesson.isPublished) {
       throw new NotFoundException('Lesson not found');
+    }
+
+    const unlocked = await this.tracksService.isLessonUnlocked(userId, lessonId);
+    if (!unlocked) {
+      throw new ForbiddenException('Lesson is locked');
     }
 
     const progress = await this.prisma.userLessonProgress.findUnique({
       where: { userId_lessonId: { userId, lessonId } },
     });
 
+    const trackView = await this.tracksService.getTrackView(
+      userId,
+      lesson.section.course.language,
+    );
+
     return {
-      ...lesson,
-      userProgress: {
-        completed: progress?.isCompleted ?? false,
-        progressPercent: progress?.progressPercent ?? 0,
+      lesson: {
+        id: lesson.id,
+        slug: lesson.slug,
+        title: lesson.title,
+        description: lesson.description,
+        estimatedMinutes: lesson.estimatedMinutes,
+        xpReward: lesson.xpReward,
+        difficulty: lesson.difficulty,
+        progress: {
+          status: progress?.status ?? LessonProgressStatus.NOT_STARTED,
+          progressPercent: progress?.progressPercent ?? 0,
+          isCompleted: progress?.isCompleted ?? false,
+        },
+        blocks: lesson.blocks.map((b) => ({
+          id: b.id,
+          type: b.type,
+          order: b.order,
+          payload: b.payload,
+        })),
       },
-    };
-  }
-
-  async complete(lessonId: string, userId: string) {
-    const lesson = await this.prisma.lesson.findUnique({ where: { id: lessonId } });
-    if (!lesson || !lesson.isPublished) {
-      throw new NotFoundException('Lesson not found');
-    }
-
-    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
-
-    const existing = await this.prisma.userLessonProgress.findUnique({
-      where: { userId_lessonId: { userId, lessonId } },
-    });
-    const alreadyCompleted = existing?.isCompleted ?? false;
-
-    const earnedXp = alreadyCompleted ? 0 : lesson.xpReward;
-    const totalXp = user.xp + earnedXp;
-    const newLevel = Math.floor(totalXp / 100) + 1;
-
-    // ── Streak logic ─────────────────────────────────────────────────────────
-    const todayUTC = startOfDayUTC(new Date());
-    const lastActivity = user.lastActivityDate;
-    let newStreak = user.streak;
-    let updateActivity = false;
-
-    if (!alreadyCompleted) {
-      if (!lastActivity) {
-        newStreak = 1;
-        updateActivity = true;
-      } else {
-        const lastDay = startOfDayUTC(lastActivity);
-        const diffDays = Math.floor(
-          (todayUTC.getTime() - lastDay.getTime()) / (1000 * 60 * 60 * 24),
-        );
-
-        if (diffDays === 0) {
-          // Already had activity today — streak unchanged
-        } else if (diffDays === 1) {
-          newStreak = user.streak + 1;
-          updateActivity = true;
-        } else {
-          newStreak = 1;
-          updateActivity = true;
-        }
-      }
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    await this.prisma.$transaction(async (tx) => {
-      await tx.userLessonProgress.upsert({
-        where: { userId_lessonId: { userId, lessonId } },
-        create: {
-          userId,
-          lessonId,
-          isCompleted: true,
-          progressPercent: 100,
-          xpEarned: earnedXp,
-          completedAt: new Date(),
-          lastOpenedAt: new Date(),
+      sidebar: {
+        currentTrack: {
+          title: trackView.title,
+          progressPercent: trackView.progressPercent,
         },
-        update: {
-          isCompleted: true,
-          progressPercent: 100,
-          lastOpenedAt: new Date(),
-          ...(!alreadyCompleted && {
-            xpEarned: earnedXp,
-            completedAt: new Date(),
-          }),
-        },
-      });
-
-      if (!alreadyCompleted) {
-        await tx.user.update({
-          where: { id: userId },
-          data: {
-            xp: { increment: earnedXp },
-            level: newLevel,
-            ...(updateActivity && {
-              streak: newStreak,
-              lastActivityDate: new Date(),
-            }),
-          },
-        });
-
-        await tx.dailyActivity.upsert({
-          where: { userId_date: { userId, date: todayUTC } },
-          create: { userId, date: todayUTC, lessonsCompleted: 1 },
-          update: { lessonsCompleted: { increment: 1 } },
-        });
-      }
-    });
-
-    return {
-      success: true,
-      earnedXp,
-      totalXp,
-      streak: newStreak,
-      level: newLevel,
+        sections: trackView.sections,
+      },
     };
   }
 }

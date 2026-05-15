@@ -40,14 +40,12 @@ src/
       dto/            # CreateUserDto
     onboarding/       # quiz after registration — done
       dto/            # CreateOnboardingDto, UpdateOnboardingDto
-    lessons/          # lesson content + completion — done
+    lessons/          # lesson runtime: GET, start, completeBlock, complete
+    tracks/           # course → sections → lessons view + unlock logic
     for-you/          # aggregated homepage feed — done
     progress/         # UserLessonProgress reads — done (no HTTP endpoints)
-    courses/          # planned — course catalog
+    profile/          # current user profile — done
     tasks/            # planned — exercises/quizzes after lessons
-    xp/               # planned — XP awarding logic (now inline in lessons)
-    streak/           # planned — streak (now inline in lessons)
-    profile/          # planned — public user profile
     admin/            # planned — admin panel API
   common/
     prisma/           # PrismaService (global singleton)
@@ -142,22 +140,34 @@ All routes are prefixed with `/api`. Swagger UI is at `/api/docs`. Swagger JSON 
 | xp | Int | 0 | total XP |
 | level | Int | 1 | derived from xp |
 | streak | Int | 0 | current day streak |
-| streakLastDate | DateTime? | null | last activity date |
+| lastActivityDate | DateTime? | null | last activity date (UTC) |
 | isOnboardingComplete | Boolean | false | set after onboarding quiz |
 | createdAt | DateTime | now() | auto |
 | updatedAt | DateTime | updatedAt | auto |
 
-### Implemented models
-- `Lesson` — content unit with theory, quiz, code tasks, XP reward, difficulty, language
-- `TheoryBlock` — text content block (belongs to Lesson)
-- `QuizQuestion` + `QuizAnswer` — quiz with answers (belongs to Lesson)
-- `CodeTask` — code exercise (belongs to Lesson)
-- `UserLessonProgress` — per-user lesson state (progressPercent, isCompleted, xpEarned)
-- `DailyActivity` — daily lesson completion count for streak tracking
+### Domain hierarchy
 
-### Planned models (future migrations)
-- `Course` — group lessons into named courses
-- `XpEvent` — immutable log of every XP grant (userId, amount, reason, createdAt)
+```
+Course (per language)
+└── CourseSection (ordered)
+    └── Lesson (ordered, slug, isFree?)
+        └── LessonBlock (ordered, type, payload Json)
+```
+
+### Implemented models
+- `Course` — top-level container per language (slug, totalXp, estimatedMinutes)
+- `CourseSection` — ordered group of lessons within a course
+- `Lesson` — slug, sectionId, order, xpReward, difficulty (BEGINNER/BASIC/INTERMEDIATE/ADVANCED), isPublished, isFree
+- `LessonBlock` — `type` (THEORY/ANALOGY/CODE/EXPLANATION/MISTAKE/QUIZ) + `payload Json`
+- `UserLessonProgress` — per-user lesson state (`status` enum, progressPercent, isCompleted, xpEarned, completedAt)
+- `UserLessonBlockProgress` — per-user block completion (`@@unique([userId, blockId])`)
+- `DailyActivity` — per UTC day, lessonsCompleted counter
+- `XPTransaction` — append-only audit log of every XP award
+- `DailyChallenge` + `UserDailyChallenge` — architecture-only, no endpoints yet
+
+### Removed (course_engine migration)
+- `TheoryBlock`, `QuizQuestion`, `QuizAnswer`, `CodeTask` — replaced by `LessonBlock`
+- `UserQuizAnswer`, `UserCodeTaskSubmission` — replaced by `UserLessonBlockProgress`
 
 ## Package decisions (why)
 
@@ -173,10 +183,14 @@ All routes are prefixed with `/api`. Swagger UI is at `/api/docs`. Swagger JSON 
 | users | ✅ done | POST /api/users, GET /api/users, GET /api/users/:id |
 | auth | ✅ done | POST /api/auth/register, POST /api/auth/login, GET /api/auth/me |
 | onboarding | ✅ done | POST /api/onboarding, GET /api/onboarding/me, PATCH /api/onboarding/me |
-| lessons | ✅ done | GET /api/lessons/:id, POST /api/lessons/:id/complete |
-| for-you | ✅ done | GET /api/for-you |
+| lessons | ✅ done | GET /api/lessons/:id, POST /api/lessons/:id/start, POST /api/lessons/:lessonId/blocks/:blockId/complete, POST /api/lessons/:id/complete |
+| tracks | ✅ done | GET /api/tracks/:language (course → sections → lessons + lock state) |
+| for-you | ✅ done | GET /api/for-you (hero-driven, language scoped) |
 | progress | ✅ done | no HTTP — ProgressService used internally |
-| courses | planned | — |
+| profile | ✅ done | GET /api/profile/me, PATCH /api/profile/me, POST /api/profile/logout |
 | tasks | planned | — |
-| profile | planned | — |
 | admin | planned | — |
+
+## Seeding
+
+`pnpm prisma:seed` runs `prisma/seed.ts` and idempotently rebuilds the Python course (5 sections, 35 lessons, ~600 XP, ~265 min). Every lesson has 6 blocks (theory + analogy + code + explanation + mistake + quiz). Re-running wipes existing courses (cascades clean up sections/lessons/blocks/progress).
