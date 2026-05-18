@@ -1,10 +1,7 @@
-import {
-  ConflictException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Onboarding } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { getStartingLessonId } from '../../curriculum/registry';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { UpdateOnboardingDto } from './dto/update-onboarding.dto';
 
@@ -18,9 +15,16 @@ export class OnboardingService {
       throw new ConflictException('Onboarding already completed');
     }
 
+    const startingLessonId = getStartingLessonId(dto.selectedLanguage, dto.currentLevel);
+
     const [onboarding] = await this.prisma.$transaction([
       this.prisma.onboarding.create({
-        data: { userId, ...dto, isCompleted: true },
+        data: {
+          userId,
+          ...dto,
+          startingLessonId,
+          isCompleted: true,
+        },
       }),
       this.prisma.user.update({
         where: { id: userId },
@@ -39,9 +43,21 @@ export class OnboardingService {
     const existing = await this.findByUser(userId);
     if (!existing) throw new NotFoundException('Onboarding not found');
 
+    // Recompute the adaptive starting point if level or language changed.
+    const nextLanguage = dto.selectedLanguage ?? existing.selectedLanguage;
+    const nextLevel = dto.currentLevel ?? existing.currentLevel;
+    const shouldRecomputeStart =
+      (dto.selectedLanguage && dto.selectedLanguage !== existing.selectedLanguage) ||
+      (dto.currentLevel && dto.currentLevel !== existing.currentLevel);
+
     return this.prisma.onboarding.update({
       where: { userId },
-      data: dto,
+      data: {
+        ...dto,
+        ...(shouldRecomputeStart
+          ? { startingLessonId: getStartingLessonId(nextLanguage, nextLevel) }
+          : {}),
+      },
     });
   }
 }

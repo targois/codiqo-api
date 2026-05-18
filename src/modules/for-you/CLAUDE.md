@@ -2,7 +2,9 @@
 
 ## Purpose
 
-Single aggregated endpoint for the homepage feed. Combines user stats, hero recommendation, next lessons queue, language tracks, and daily progress in one response. Hero is fully API-driven.
+Homepage feed aggregator. Returns the user's gamification state, onboarding context, completion list, and today's daily activity in a single request. The frontend uses this together with its local curriculum registry to render the homepage (recommended lesson, next lessons, language tracks).
+
+The backend does NOT compute "next lesson", "track tile", or "recommended hero" — those are derived on the frontend from `completedLessons` + the curriculum it owns.
 
 ## Endpoint
 
@@ -10,81 +12,49 @@ Single aggregated endpoint for the homepage feed. Combines user stats, hero reco
 |---|---|---|
 | GET | `/api/for-you` | JWT required |
 
-## Response shape
+## Response
 
 ```json
 {
-  "user": { "xp": 10, "streak": 1, "level": 1, "username": "...", "displayName": "..." },
-  "onboarding": { "selectedLanguage": "PYTHON", "currentLevel": "BEGINNER" },
-  "dailyProgress": { "completedLessons": 1, "totalLessons": 35 },
-  "recommendedLesson": {
-    "id": "...", "title": "...", "description": "...",
-    "estimatedMinutes": 5, "xpReward": 10,
-    "difficulty": "BEGINNER", "language": "PYTHON",
-    "progressPercent": 33, "completedLessons": 1, "totalLessons": 35
+  "user": {
+    "xp": 75, "streak": 3, "level": 1,
+    "username": "python_learner", "displayName": "Python User"
   },
-  "nextLessons": [
-    { "id": "...", "title": "...", "isCompleted": true, "isLocked": false, "language": "PYTHON", "difficulty": "BEGINNER" }
-  ],
-  "tracks": [
-    { "language": "PYTHON", "progressPercent": 3, "completedLessons": 1, "totalLessons": 35 }
-  ],
-  "stats": { "completedLessons": 1, "totalMinutesLearned": 5 }
+  "onboarding": {
+    "selectedLanguage": "PYTHON",
+    "currentLevel": "BEGINNER"
+  },
+  "completedLessons": ["python-print-first-output", "python-variables"],
+  "dailyProgress": { "completedLessons": 1 }
 }
 ```
 
-## Schema impact: language now lives on Course
+| Field | Notes |
+|---|---|
+| `user.*` | Cached gamification stats from `User`. |
+| `onboarding` | `null` when onboarding is not yet completed. |
+| `completedLessons` | Every `lessonId` the user has completed, across every language. |
+| `dailyProgress.completedLessons` | Count of lessons completed today (UTC), from `DailyActivity`. |
 
-Lesson no longer has a `language` column. The for-you query joins through `Lesson → CourseSection → Course → language`:
+## Query strategy
 
-```ts
-prisma.lesson.findMany({
-  where: { isPublished: true, section: { course: { isPublished: true } } },
-  include: { section: { include: { course: { select: { language: true } } } } },
-  orderBy: [{ section: { order: 'asc' } }, { order: 'asc' }],
-});
-```
+3 queries:
+1. user + onboarding (1 row)
+2. all `UserLessonProgress` rows where `isCompleted = true` (lessonId only)
+3. today's `DailyActivity` row
 
-After the query, lessons are flattened to `{ ..., language, sectionOrder }` so downstream filters/grouping look like the old single-table version.
+No joins to a `Lesson` table — there isn't one. The endpoint stays a cheap aggregator.
 
-## Recommendation algorithm — deterministic, never null when lessons exist
+## Frontend usage
 
-Three cases, evaluated in order:
-1. **New user** (`completedInLang === 0`) → first lesson in `selectedLanguage` by sequence
-2. **Returning user** (has completions, unfinished remain) → first unfinished by sequence
-3. **All complete** → last completed in language; falls back to first lesson
-
-Sequence = `section.order ASC, lesson.order ASC` (course-wide).
-
-## Language consistency — STRICT
-
-`recommendedLesson.language` always equals `onboarding.selectedLanguage`.
-`nextLessons` are always in `selectedLanguage`.
-TypeScript lessons NEVER show for a PYTHON user.
-
-If onboarding is incomplete → fallback to all lessons.
-
-## Progress calc (hero)
-
-```
-progressPercent = floor(completedInLang / totalLessons * 100)
-```
-
-`tracks[]` uses `Math.round` (visual). `recommendedLesson.progressPercent` uses `Math.floor` (truthful).
-
-## Tracks
-
-Built from `Lesson → Course.language` grouping. Onboarding language sorts first. Only languages with at least one published lesson appear.
-
-## Query strategy (no N+1)
-
-4 queries:
-1. user + onboarding
-2. all published lessons + their `section.course.language`
-3. all `UserLessonProgress` for user
-4. today's `DailyActivity`
-
-Language filtering and grouping happen in-memory after the lesson fetch.
+| UI element | Source |
+|---|---|
+| Greeting / username | `user.username` |
+| XP / level / streak header | `user.xp`, `user.level`, `user.streak` |
+| Recommended lesson hero | derived: first lesson in `onboarding.selectedLanguage` not in `completedLessons` |
+| Next lessons queue | derived: next N lessons from the local curriculum after the recommended one |
+| Track tiles | derived: per-language completion ratio from `completedLessons` + curriculum totals |
+| Daily progress | `dailyProgress.completedLessons` vs. the user's daily goal |
 
 ## File structure
 
